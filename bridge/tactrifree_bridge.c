@@ -1,4 +1,4 @@
-/* tactrifree 1.0 beta4 - SPDX-License-Identifier: GPL-3.0-or-later */
+/* tactrifree 1.0 beta5 - SPDX-License-Identifier: GPL-3.0-or-later */
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
@@ -525,7 +525,7 @@ static void read_ini(HINSTANCE hi){
     { char tp[64]; GetPrivateProfileStringA("bridge","TestPath","",tp,sizeof tp,p); _strlwr(tp);
       MultiByteToWideChar(CP_ACP,0,tp,-1,g_testpath,64); } }
 
-#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta4 (0.13, 2026-11-11)"
+#define BRIDGE_VERSION "TactriFree EcuFlash bridge 1.0 beta5 (0.13, 2026-11-11)"
 __declspec(dllexport) const char * __cdecl TactriFreeBridgeVersion(void){ return BRIDGE_VERSION; }
 
 BOOL WINAPI DllMain(HINSTANCE hi, DWORD r, LPVOID rs){ (void)rs;

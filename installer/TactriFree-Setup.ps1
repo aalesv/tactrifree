@@ -1,6 +1,6 @@
 # TactriFree-Setup.ps1 - install / uninstall TactriFree (open-source J2534 driver + EcuFlash bridge for the OpenPort 2.0)
 #
-#   Install   : TactriFree-Setup.ps1                 (Administrator; or double-click "Install TactriFree.cmd")
+#   Install   : TactriFree-Setup.ps1                 (Administrator; or double-click "installer.cmd")
 #   Uninstall : TactriFree-Setup.ps1 -Uninstall      (or Settings > Apps > TactriFree, or "Uninstall TactriFree.cmd")
 #   Preview   : add -Plan  (shows every step, changes nothing, no Administrator needed)
 #
@@ -19,11 +19,14 @@
 #     plugged in the cable is re-bound at once - a short disconnect, like a replug), then the old package and its
 #     certificate are removed. Another WinUSB setup that already works (e.g. Zadig + the EcuFlash interface ID) is
 #     kept unless -RebindDriver.
-#  4. EcuFlash bridge: glu32.dll + tactrifree-bridge.ini into EcuFlash's folder (found via its uninstall entry, else
+#  4. Original Tactrix drivers: lists what it finds (OpenPort 2.0 driver package openport2.inf + its "openport" service,
+#     Tactrix-signed OpenPort 1.3 FTDI packages, Tactrix J2534 entries + their op20pt DLL, Tactrix certificates) and
+#     removes them only if you answer Y. No backup: reinstalling EcuFlash with its driver option puts them back.
+#  5. EcuFlash bridge: glu32.dll + tactrifree-bridge.ini into EcuFlash's folder (found via its uninstall entry, else
 #     the default folder). Never overwrites a glu32.dll that is not the bridge; keeps an existing ini (your settings).
-#  5. An entry in Settings > Apps for uninstalling.
-# Uninstall reverses every step that install recorded (install-state.json); the cable then returns to whatever
-# driver Windows has for it after a replug.
+#  6. An entry in Settings > Apps for uninstalling.
+# Uninstall reverses every step that install recorded (install-state.json), except step 4; the cable then returns to
+# whatever driver Windows has for it after a replug.
 #
 # Not affiliated with or endorsed by Tactrix. "OpenPort 2.0" names the hardware TactriFree is compatible with.
 #
@@ -34,7 +37,7 @@
 param([switch]$Uninstall, [switch]$Plan, [string]$EcuFlashDir = '', [switch]$SkipBridge, [switch]$SkipDriver,
       [switch]$RebindDriver, [string]$SandboxRoot = '', [switch]$NoPause)
 $ErrorActionPreference = 'Stop'
-$Version   = '1.0 beta4'
+$Version   = '1.0 beta5'
 $Here      = $PSScriptRoot
 $HwIds     = @('USB\VID_0403&PID_CC4D', 'USB\VID_0403&PID_CC4C&MI_00')   # the cable, and its composite form
 $GuidEf    = '{6D1781B7-C987-4F6C-8D4F-1EFC098BEA67}'     # interface ID EcuFlash's built-in library looks for
@@ -106,13 +109,51 @@ function Find-EcuFlash(){
 function Inf-Version($inf){                  # DriverVer = mm/dd/yyyy,a.b.c.d  ->  [version]
     $m = Select-String -LiteralPath $inf -Pattern 'DriverVer\s*=\s*[^,]*,\s*([0-9.]+)' | Select-Object -First 1
     if($m){ return [version]$m.Matches[0].Groups[1].Value }; return [version]'0.0' }
-function Our-Packages(){                      # every TactriFree WinUSB package in the driver store: @{pub; ver}
-    $r = @(); $cur = $null
+function Driver-Packages(){                   # every package in the driver store: @{pub; orig; prov; signer; ver}
+    # XML output (any Windows language; Windows 11 / newer Windows 10) else the English text output
+    $ErrorActionPreference = 'Continue'; $r = @(); $x = ''
+    try { $x = (& pnputil.exe /enum-drivers /format xml 2>&1 | Out-String) } catch {}
+    if($x.TrimStart().StartsWith('<?xml')){
+        foreach($d in @(([xml]$x).PnpUtil.Driver)){ if(-not $d){ continue }
+            $v = [version]'0.0'; if("$($d.DriverVersion)" -match '([0-9]+(\.[0-9]+){1,3})\s*$'){ $v = [version]$Matches[1] }
+            $r += [pscustomobject]@{ pub="$($d.DriverName)"; orig="$($d.OriginalName)"; prov="$($d.ProviderName)"; signer="$($d.SignerName)"; ver=$v } }
+        return $r }
+    $cur = $null
     foreach($line in (& pnputil.exe /enum-drivers)){
-        if($line -match '^\s*Published Name:\s*(\S+)'){ $cur = @{ pub = $Matches[1]; orig = ''; ver = [version]'0.0' } }
+        if($line -match '^\s*Published Name:\s*(\S+)'){ if($cur){ $r += [pscustomobject]$cur }
+            $cur = [ordered]@{ pub=$Matches[1]; orig=''; prov=''; signer=''; ver=[version]'0.0' } }
         elseif($cur -and $line -match '^\s*Original Name:\s*(\S+)'){ $cur.orig = $Matches[1] }
-        elseif($cur -and $line -match '^\s*Driver Version:\s*\S+\s+([0-9.]+)'){
-            $cur.ver = [version]$Matches[1]; if($cur.orig -ieq 'tactrifree_winusb.inf'){ $r += [pscustomobject]$cur }; $cur = $null } }
+        elseif($cur -and $line -match '^\s*Provider Name:\s*(.+)$'){ $cur.prov = $Matches[1].Trim() }
+        elseif($cur -and $line -match '^\s*Signer Name:\s*(.+)$'){ $cur.signer = $Matches[1].Trim() }
+        elseif($cur -and $line -match '^\s*Driver Version:\s*\S+\s+([0-9.]+)'){ $cur.ver = [version]$Matches[1] } }
+    if($cur){ $r += [pscustomobject]$cur }
+    return $r }
+function Our-Packages(){                      # every TactriFree WinUSB package in the driver store: @{pub; ver}
+    return @(Driver-Packages | Where-Object { $_.orig -ieq 'tactrifree_winusb.inf' }) }
+function Tactrix-Items(){                     # the original Tactrix drivers on this PC: @{kind; id; text; ...}
+    $r = @()
+    if(-not $Sandbox){
+        foreach($p in @(Driver-Packages | Where-Object { $_.orig -ine 'tactrifree_winusb.inf' -and
+                        ($_.orig -ieq 'openport2.inf' -or ($_.prov + ' ' + $_.signer) -match 'Tactrix') })){
+            $what = if($p.orig -ieq 'openport2.inf'){ 'OpenPort 2.0 driver (openport.sys)' }
+                    elseif($p.orig -match '^ftdi'){ 'OpenPort 1.3 driver (FTDI; blocks Windows Memory integrity)' } else { 'driver' }
+            $r += [pscustomobject]@{ kind='package'; id=$p.pub; text="Tactrix $what - driver package $($p.pub) ($($p.orig) v$($p.ver))" } }
+        $sk = 'HKLM:\SYSTEM\CurrentControlSet\Services\openport'
+        if(Test-Path $sk){ $ip = [string](Get-ItemProperty $sk -ErrorAction SilentlyContinue).ImagePath
+            if($ip -match 'openport\.sys'){ $r += [pscustomobject]@{ kind='service'; id='openport'; text='Tactrix kernel driver service "openport" (openport.sys)' } } }
+        foreach($store in 'TrustedPublisher','Root'){
+            foreach($c in @(Get-ChildItem "Cert:\LocalMachine\$store" -ErrorAction SilentlyContinue | Where-Object { $_.Subject -like 'CN=Tactrix*' })){
+                $r += [pscustomobject]@{ kind='cert'; id=$c.PSPath; text="certificate '$($c.Subject.Split(',')[0])' in $store (lets Tactrix drivers install without asking)" } } }
+    }
+    foreach($root in @($Reg32Root, $Reg64Root) | Select-Object -Unique){
+        $pk = $RegBase.OpenSubKey($root + '\PassThruSupport.04.04'); if(-not $pk){ continue }
+        foreach($n in $pk.GetSubKeyNames()){
+            if($n -like 'TactriFree*'){ continue }   # ours (incl. old test entries named "... for Tactrix ...")
+            $k = $pk.OpenSubKey($n); $nm = [string]$k.GetValue('Name'); $vd = [string]$k.GetValue('Vendor'); $fl = [string]$k.GetValue('FunctionLibrary'); $k.Close()
+            if($vd -match 'Tactrix' -or $n -match '^Tactrix' -or $nm -match '^Tactrix'){
+                $r += [pscustomobject]@{ kind='j2534'; id=($root + '\PassThruSupport.04.04\' + $n); dll=$fl
+                    text="J2534 entry '$n' for $(if($root -match 'WOW6432Node'){'32'}else{'64'})-bit programs$(if($fl){" ($fl)"})" } } }
+        $pk.Close() }
     return $r }
 function Read-State(){ if(Test-Path $State){ return (Get-Content $State -Raw | ConvertFrom-Json) }; return $null }
 
@@ -129,7 +170,7 @@ public static class TfNewDev {
 Say "TactriFree $Version setup  ($(if($Uninstall){'uninstall'}else{'install'})$(if($Plan){', PLAN ONLY - nothing is changed'})$(if($Sandbox){', SANDBOX '+$SandboxRoot}))"
 if(-not $Sandbox -and -not $Plan){
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if(-not $admin){ throw 'Run as Administrator (right-click > Run as administrator, or use "Install TactriFree.cmd").' }
+    if(-not $admin){ throw 'Run as Administrator (right-click > Run as administrator, or use "installer.cmd").' }
     if([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess){
         throw 'Run from 64-bit PowerShell (the .cmd launchers do this).' }
 }
@@ -175,6 +216,7 @@ if($Uninstall){
             $cmd = "/c timeout /t 4 /nobreak >nul & rmdir /s /q `"$Dir64`" & rmdir /s /q `"$Dir86`""
             Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\cmd.exe') -ArgumentList $cmd -WindowStyle Hidden }
     }
+    if($st -and @($st.tactrixRemoved).Count){ Say ''; Say 'The original Tactrix drivers removed at install are not restored: reinstall EcuFlash (with its driver option) to get them back.' }
     Say ''; if($Plan){ Say 'Plan complete - nothing was changed.'; exit 0 }; Say 'TactriFree removed. Unplug and replug the cable.'
     if(-not $NoPause -and -not $Sandbox){ Read-Host 'Press Enter to close' | Out-Null }
     exit 0
@@ -184,8 +226,8 @@ if($Uninstall){
 foreach($f in 'x86\tactrifree32.dll','x64\tactrifree64.dll','bridge\glu32.dll','bridge\tactrifree-bridge.ini','driver\tactrifree_winusb.inf','driver\tactrifree_winusb.cat'){
     if(-not (Test-Path (Join-Path $Here $f))){ throw "Package file missing: $f (run this from the TactriFree package folder)." } }
 $st = [ordered]@{ version=$Version; installed=(Get-Date).ToString('s'); sandbox=$Sandbox; files=@(); bridgeDir=''; bridgeIniInstalled=$false;
-                  driverInf=''; certThumbprint=''; driverNote='' }
-$prev = Read-State; if($prev){ foreach($k in 'driverInf','certThumbprint','bridgeDir','bridgeIniInstalled'){ if($prev.$k){ $st[$k] = $prev.$k } } }
+                  driverInf=''; certThumbprint=''; driverNote=''; tactrixRemoved=@() }
+$prev = Read-State; if($prev){ foreach($k in 'driverInf','certThumbprint','bridgeDir','bridgeIniInstalled','tactrixRemoved'){ if($prev.$k){ $st[$k] = $prev.$k } } }
 
 Step '1. Driver files'
 Do-It "copy tactrifree32.dll -> $Dir86" { New-Item -ItemType Directory -Force $Dir86 | Out-Null; Copy-Item (Join-Path $Here 'x86\tactrifree32.dll') $Dir86 -Force }
@@ -286,7 +328,49 @@ else {
     if(-not $Plan){ Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Step '4. EcuFlash bridge'
+Step '4. Original Tactrix drivers'
+$tx = @(Tactrix-Items)
+if(-not $tx){ Say '   none found' }
+elseif($SkipDriver){ Say '   found, but kept (-SkipDriver: the cable may still be using them)' }
+else {
+    Say '   found on this PC (not needed by TactriFree; reinstalling EcuFlash with its driver option puts them back):'
+    foreach($i in $tx){ Say "    - $($i.text)" }
+    $yes = $false
+    if($Plan){ Say '   [plan] asks "Remove them? (Y/N)"' }
+    else { $a = Read-Host '   Remove them? (Y/N)'; $script:log.Add("   answer: $a"); $yes = ($a.Trim() -match '^[Yy]') }
+    if(-not $Plan -and -not $yes){ Say '   kept' }
+    elseif($yes){
+        $st.tactrixRemoved = @($st.tactrixRemoved)
+        $order = @{ package=0; service=1; j2534=2; cert=3 }
+        foreach($i in @($tx | Sort-Object { $order[$_.kind] })){
+            try {
+                switch($i.kind){
+                    'package' {     # /uninstall: devices still using it (e.g. an unplugged cable's old entry) drop it; no /force
+                        $o = (& pnputil.exe /delete-driver $i.id /uninstall 2>&1 | Out-String).Trim()
+                        $gone = -not @(Driver-Packages | Where-Object { $_.pub -ieq $i.id })
+                        Say ("   $(if($gone){'removed'}else{'NOT removed'}): $($i.text)$(if(-not $gone){' - pnputil: ' + ($o -replace "`r?`n",' | ')})") }
+                    'service' {
+                        $o = (& sc.exe delete openport 2>&1 | Out-String).Trim(); Say "   service openport: $($o -replace "`r?`n",' | ')"
+                        $sys = Join-Path $env:SystemRoot 'System32\drivers\openport.sys'
+                        if(Test-Path $sys){ Remove-Item -LiteralPath $sys -Force -ErrorAction SilentlyContinue
+                            Say "   $(if(Test-Path $sys){'NOT removed (in use until a restart)'}else{'removed'}): $sys" }
+                        else { Say "   $sys already removed by Windows with the driver package" } }
+                    'j2534' {
+                        Reg-Delete $i.id; Say "   removed: $($i.text)"
+                        $others = @($tx | Where-Object { $_.kind -eq 'j2534' -and $_.id -ne $i.id -and $_.dll -ieq $i.dll -and $RegBase.OpenSubKey($_.id) })
+                        if($i.dll -and (Split-Path $i.dll -Leaf) -match '^op20pt' -and -not $others){
+                            if(Test-Path -LiteralPath $i.dll){ Remove-Item -LiteralPath $i.dll -Force -ErrorAction SilentlyContinue
+                                Say "   $(if(Test-Path -LiteralPath $i.dll){'NOT removed (in use)'}else{'removed'}): $($i.dll)" }
+                            else { Say "   $($i.dll) already removed by Windows with the driver package" } } }
+                    'cert' { Remove-Item $i.id -Force; Say "   removed: $($i.text)" }
+                }
+                $st.tactrixRemoved += $i.text
+            } catch { Say "   NOT removed: $($i.text) - $($_.Exception.Message)" }
+        }
+    }
+}
+
+Step '5. EcuFlash bridge'
 $ef = Find-EcuFlash
 if($SkipBridge){ Say '   skipped (-SkipBridge)' }
 elseif(-not $ef -or -not (Test-Path (Join-Path $ef 'ecuflash.exe'))){ Say '   EcuFlash not found - skipped (run again with -EcuFlashDir <folder> after installing it)' }
@@ -301,7 +385,7 @@ else {
             $st.bridgeIniInstalled = $true }
         else { Say '   existing tactrifree-bridge.ini kept (your settings)' } } }
 
-Step '5. Settings > Apps entry'
+Step '6. Settings > Apps entry'
 $setupCopy = Join-Path $Dir64 'setup\TactriFree-Setup.ps1'
 $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 Do-It "register 'TactriFree' for uninstall" {
